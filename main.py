@@ -1,17 +1,29 @@
-# polymarket-nvidia-ceo-forecast-01: adaptive persistence forecaster.
+# polymarket-nvidia-ceo-forecast-01: adaptive persistence forecaster, round 2.
 #
-# Model (tuned on the kit's six practice cases, loss 0.266819 vs the house
-# baseline's 0.363589, beating it on every practice case):
-#   - median: the market's last price (persistence; any drift or smoothing of
-#     the centre made practice worse).
+# Model (tuned on the kit's six practice cases, loss 0.261907 vs the house
+# baseline's 0.363589 and round 1's 0.266819, beating the baseline on every
+# practice case):
+#   - centre: 0.7 * last price + 0.3 * previous price (a one-step pullback
+#     toward the previous print: prices jump then partly revert, so the
+#     last print alone overshoots; a plain median of the last k was worse).
 #   - spread: per-market sigma from the realised volatility of the last 120
 #     one-minute returns (short window: volatility is strongly time-varying
 #     and long windows are poisoned by rare jumps), floored at 0.0005 and
 #     capped at 0.01, growing like h**0.35 (sub-diffusive: prices are steppy
 #     and jump-then-revert, so the spread saturates instead of sqrt(h)).
-#   - quantiles: x + z_tau * sigma * h**0.35 with heavy outer tails
-#     z = [-2.1, -0.67449, 0, 0.67449, 2.1] (jumps punish narrow tails),
-#     clamped to [0, 1] and rounded to 6 decimals.
+#   - quantiles: centre + z_tau * sigma * h**0.35, where the z multipliers
+#     are asymmetric per price level (a market's last price x selects the
+#     row): low-priced markets are floored at 0 and jump up, so their upper
+#     tail is wider; high-priced markets drift down over the window, so
+#     their lower tail is wider. The asymmetry applies to the outer and the
+#     inner quantiles alike (both tails of the same side move together).
+#     Rows are (x_lo, down_mult, up_mult):
+#       x < 0.02:  (0.85, 1.30)
+#       x < 0.05:  (1.05, 1.00)
+#       x < 0.15:  (1.20, 0.85)
+#       x >= 0.15: (1.35, 0.75)
+#     with base z = [-2.1, -0.67449, 0, 0.67449, 2.1], clamped to [0, 1]
+#     and rounded to 6 decimals.
 #
 # Python 3.13, standard library only, no network, deterministic.
 
@@ -26,11 +38,21 @@ OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
 # Standard-normal quantiles at the five levels, with the outer pair widened
 # to 2.1 for jump-heavy tails (tuned on practice; 2.0/2.2 are within noise).
-Z = [-2.1, -0.67449, 0.0, 0.67449, 2.1]
+Z_BASE = [-2.1, -0.67449, 0.0, 0.67449, 2.1]
 VOL_WINDOW = 120          # minutes of recent 1-min returns used for sigma
 SIGMA_FLOOR = 0.0005      # never forecast a dead-quiet market as frozen
 SIGMA_CAP = 0.01          # one jump must not blow the spread up
 ALPHA = 0.35              # spread growth exponent in horizon h
+# Centre weights, newest first: 0.7 * last price + 0.3 * previous price.
+CENTRE_W = (0.7, 0.3)
+# (x_lo, down_mult, up_mult): first row whose x_lo <= x wins. Low-priced
+# markets jump up (floor at 0); high-priced markets drift down.
+ASYM_ROWS = (
+    (0.0, 0.85, 1.30),
+    (0.02, 1.05, 1.00),
+    (0.05, 1.20, 0.85),
+    (0.15, 1.35, 0.75),
+)
 
 
 def price6(x):
@@ -52,16 +74,34 @@ def market_sigma(prices):
     return min(max(sigma, SIGMA_FLOOR), SIGMA_CAP)
 
 
+def asym_multipliers(x):
+    """(down_mult, up_mult) for a market whose last price is x."""
+    down, up = ASYM_ROWS[0][1], ASYM_ROWS[0][2]
+    for lo, d, u in ASYM_ROWS:
+        if x >= lo:
+            down, up = d, u
+    return down, up
+
+
 def forecast_market(market, horizon):
     prices = market["prices"]
     if not prices:
         raise ValueError(f"market {market['id']} has no prices")
     x = prices[-1]
+    # Centre: weighted average of the last two prints (pullback toward the
+    # previous print); a single print falls back to the last price.
+    if len(prices) >= 2:
+        centre = CENTRE_W[0] * prices[-1] + CENTRE_W[1] * prices[-2]
+    else:
+        centre = x
     sigma = market_sigma(prices)
+    down, up = asym_multipliers(x)
+    z = [Z_BASE[0] * down, Z_BASE[1] * down, 0.0, Z_BASE[3] * up,
+         Z_BASE[4] * up]
     rows = []
     for h in range(1, horizon + 1):
         spread = sigma * (h ** ALPHA)
-        row = [price6(x + z * spread) for z in Z]
+        row = [price6(centre + zj * spread) for zj in z]
         # Rounding/clamping cannot break order here (Z is ascending), but
         # enforce non-decreasing explicitly so the output is always valid.
         for j in range(1, len(row)):
